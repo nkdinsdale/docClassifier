@@ -25,29 +25,60 @@ import zipfile
 import json
 import argparse
 import os
+import subprocess
+import sys
 
 #Project files
 from Embeddings import TfidfEmbeddingVectorizer
 from re_functions import *
+from regressor_functions import *
 
 ################################################################################
 # Get the file name from the input argument
 # Input parser
+# THIS SHOULD BE IN THE FORM OF A PDF
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('-f', '--file', required=True, help="path to g file")
+parser.add_argument('-f', '--file', required=True, help="path to f file, f should be a PDF")
 args = parser.parse_args()
 file_pth = args.file
+print (file_pth)
 assert os.path.isfile(file_pth)
 
+#Run the jar to create the json files and extract the figures
+print ('EXTRACTING THE BODY OF THE DOCUMENT')
+x = subprocess.call(['java','-jar', 'pdffigures2-assembly-0.0.12-SNAPSHOT.jar', file_pth,'-g', 'g_'])
+# We cannot run this extraction on the older pdfs so force an abort if we have not succeeded
+if x == 1:
+    print ('ERROR: FAILED TO EXTRACT INFORMATION FROM PDF')
+    sys.exit()
+
+print ('EXTRACTING THE IMAGES FROM THE DOCUMENT')
+y = subprocess.call(['java', '-jar', 'pdffigures2-assembly-0.0.12-SNAPSHOT.jar', file_pth, '-m', 'm_'])
+if y == 1:
+    print('Failed to extract images')
+no = int([float(s) for s in re.findall(r'-?\d+\.?\d*', file_pth)][0])     #Use re to extract the number
+filename = 'g_id_article_' + str(no) + '.json'
 #Read in the pdf structure in the form of a json --> dictionary of dictionaries
 print ('Reading in file:')
-with open(file_pth) as json_data:
+with open(filename) as json_data:
     e = json.load(json_data)
     json_data.close()
 
 #Search the sections to try and find the sentence, its only going to be on page one or two
-sectionDict = e['sections']
+#Some of the articles store the abstract as a seperate item so look for this and search it as well7
 textstore = []
+print ('SEARCHING FOR ABSTRACT')
+try:
+    Abstract = e['abstractText']
+    print ('\t Abstract object found')
+    print ('\t Gathering Text from abstract')
+    textstore.append(Abstract['text'])
+except:
+    print ('\t No abstract object ')
+
+print ('GATHERING MAIN TEXT')
+
+sectionDict = e['sections']
 for i in range(len(sectionDict)):
     dictionary = sectionDict[i]
     subdictionary = dictionary['paragraphs']
@@ -85,122 +116,107 @@ for para in textstore:
 sentences = np.array(sentences)
 print (sentences.shape)
 
-#Build the classifier, just using the most successful one from the analysis earlier, ExtraTreesClassifier with TfidfVectorizer
-#Load in the identifier setences
-with open('diseaseidentifiers.txt', 'r') as file:
-    identifiers = file.read().splitlines()
+fittedModel = idenitifier_regressor()
+pred_id = fittedModel.predict(sentences)
 
-with open('nonIdentifiers.txt', 'r') as file:
-    nonId = file.read().splitlines()
+#Do the same for the captions
+caps = []
+tableFlag = 0
+figDict = e['figures']
+for k in range(len(figDict)):
+    fig = figDict[k]
+    if fig['figType'] == 'Figure':
+        caps.append(fig['caption'])
+    if fig['figType'] == 'Table':
+        tableFlag = 1
+capStore = []
+for cap in caps:
+    cap = cap.lower()       #Make everything lower case
+    cap = re.sub('['+string.punctuation+']', '', cap)
+    words = cap.split()
+    capStore.append(words)
 
+capmodel = caption_regressor(verbose = 1)
+pred_cap = capmodel.predict(capStore)
+args = np.argsort(pred_cap)
+args = args[::-1]
+print (args)
 
-#Load in the identifier sentences
-X, y = [], []
-j = 0
-for id in identifiers:
-    id = id.lower()                                         #Make everything lower case
-    id = re.sub('['+string.punctuation+']', '', id)         #Strip out the punctuation
-    words = id.split()
-    X.append(words)
-    y.append(1)
-    j += 1
-#Load in the none identifier sentences
-i = 0
-for id in nonId:
-    #while i < j + :        #So get the same number of each type of sentence
-    id = id.lower()                                         #Make everything lower case
-    id = re.sub('['+string.punctuation+']', '', id)         #Strip out the punctuation
-    words = id.split()
-    X.append(words)
-    y.append(0)
-    i += 1
-
-#Convert to numpy arrays to be able to use fancy idexing etc
-X = np.array(X)
-y = np.array(y)
-
-#Shuffle X and y and split into testing and training sets
-shuffler = np.random.permutation(range(X.shape[0]))
-X = X[shuffler]
-y = y[shuffler]
-
-# Make some predictions
-proportion = int(0.9 * X.shape[0])
-Xtest = X[proportion:]
-Xtrain = X[0:proportion]
-ytest = y[proportion:]
-ytrain = y[0:proportion]
-
-# train word2vec on all the texts - both training and test set# train
-# we're not using test labels, just texts so this is fine
-model = Word2Vec(X, size=100, window=5, min_count=5, workers=2)
-w2v = {w: vec for w, vec in zip(model.wv.index2word, model.wv.syn0)}
-
-etree_w2v_tfidf = Pipeline([
-    ("word2vec vectorizer", TfidfEmbeddingVectorizer(w2v)),
-    ("extra trees", ExtraTreesRegressor(n_estimators=220))])
-
-all_models = [
-    ('etree_w2v_tfidf', etree_w2v_tfidf)
-]
-
-print ('Benchmarking')
-unsorted_scores = [(name, cross_val_score(model, X, y, cv=5).mean()) for name, model in all_models]
-scores = sorted(unsorted_scores, key=lambda x: -x[1])
-print (tabulate(scores, floatfmt=".4f", headers=("model", 'score')))
-
-fittedModel = etree_w2v_tfidf.fit(X, y)
-pred = fittedModel.predict(sentences)
-
-flag = 0
-s = []
-p = []
+# Run the analysis given the model
+flagid = 0
+sid = []
+pid = []
 
 for i in range(sentences.shape[0]):
-    if pred[i] > 0.9:
-        s.append(sentences[i])
-        p.append(pred[i])
-        flag = 1
-if flag == 0:
+    if pred_id[i] > 0.9:
+        sid.append(sentences[i])
+        pid.append(pred_id[i])
+        flagid = 1
+if flagid == 0:
     for i in range(sentences.shape[0]):
-        if pred[i] > 0.8:
-            s.append(sentences[i])
-            p.append(pred[i])
-            flag = 1
-if flag == 0:
+        if pred_id[i] > 0.8:
+            sid.append(sentences[i])
+            pid.append(pred_id[i])
+            flagid = 1
+if flagid == 0:
     print ('We dont think there is an indicator sentence')
     for i in range(sentences.shape[0]):
-        if pred[i] > 0.7:
-            s.append(sentences[i])
-            p.append(pred[i])
-            flag = 1
-if flag == 0:
-    print ("Couldn't find [an idenitifer sentence")
+        if pred_id[i] > 0.7:
+            sid.append(sentences[i])
+            pid.append(pred_id[i])
+            flagid = 1
+if flagid == 0:
+    print ("Couldn't find an idenitifer sentence")
 
-s = np.array(s)
-p = np.array(p)
-I = np.argmax(p)
+I = np.argmax(pid)
 
 print ('#########################################################')
 print ('# ~~~~~~~~~~~~~~~~~~~~~~ Summary ~~~~~~~~~~~~~~~~~~~~~~ #')
-print ('Identifier Found:')
-#Stitch the sentence back together
-identifier = s[I]
-s = " "         #Use space as the thing to knit the sentences back together
-identifier = s.join( identifier)
-print (identifier)
 
-familyFlag, i = family_check(identifier)
-if familyFlag == 1:
-    print ('We think that there is a family connection because we found:')
-    print (i)
+if flagid != 0:
+    print ('IDENTIFIER SENTENCE:')
+    print ('Identifier Found:')
+    #Stitch the sentence back together
+    if pid[I] < 0.8:
+        print ('We dont think there is an identifier sentence. This was the highest scorer:')
+    identifier = sid[I]
+    s = " "         #Use space as the thing to knit the sentences back together
+    identifier = s.join(identifier)
+    print (identifier)
+    print ('This identifier scored: ', pid[I])
 
-unusualFlag, i = unusual_check(identifier)
-if unusualFlag == 1:
-    print ('We think that this condition may be atypical because we found:')
-    print (i)
+    familyFlag, i = family_check(identifier)
+    if familyFlag == 1:
+        print ('We think that there is a family connection because we found:')
+        print (i)
 
-number = number_of_patients(identifier)
-if number != 0 or None:
-    print ('We think that there are', number, 'patients in the article, because the largest number we found was:')
-    print (number)
+    unusualFlag, i = unusual_check(identifier)
+    if unusualFlag == 1:
+        print ('We think that this condition may be atypical because we found:')
+        print (i)
+
+    number = number_of_patients(identifier)
+    if number != 0 or None:
+        print ('We think that there are', number, 'patients in the article, because the largest number we found was:')
+        print (number)
+
+print ('\n \n FIGURE CAPTIONS:')
+print ('\t WARNING: pdffigures2 doesnt always extract all the figures succesfully \n')
+for a in args:
+    print ('We are %2f confident this figure has a face in it:' % pred_cap[a])
+    c = capStore[a]
+    s = " "         #Use space as the thing to knit the sentences back together
+    c = s.join(c)
+    print (c)
+    familyFlag, i = family_check(c)
+    if familyFlag == 1:
+        print ('We think that there is a family connection because we found:')
+        print (i)
+    unusualFlag, i = unusual_check(c)
+    if unusualFlag == 1:
+        print ('We think that this condition may be atypical because we found:')
+        print (i)
+    print ('\n')
+
+if tableFlag == 1:
+    print ('We think there is information held in a table in this article')
