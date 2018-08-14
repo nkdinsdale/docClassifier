@@ -1,3 +1,5 @@
+# 2018 Nicola Dinsdale
+# Dependencies: pdffigures2-assembly-0.0.12-SNAPSHOT.jar --> extracts the information from the pdf to a json file.
 import re
 import numpy as np
 import csv
@@ -27,11 +29,25 @@ import argparse
 import os
 import subprocess
 import sys
+import PyPDF2
+import pdfminer
 
 #Project files
 from Embeddings import TfidfEmbeddingVectorizer
 from re_functions import *
 from regressor_functions import *
+
+def get_info(path):
+    with open(path, 'rb') as f:
+        pdf =PyPDF2.PdfFileReader(f)
+        info = pdf.getDocumentInfo()
+        number_of_pages = pdf.getNumPages()
+    author = info.author
+    creator = info.creator
+    subject = info.subject
+    title = info.title
+
+    return info, number_of_pages
 
 ################################################################################
 # Get the file name from the input argument
@@ -43,6 +59,10 @@ args = parser.parse_args()
 file_pth = args.file
 print (file_pth)
 assert os.path.isfile(file_pth)
+
+#use pyPDF2 to get some information quickly
+info, number_of_pages = get_info(file_pth)
+
 
 #Run the jar to create the json files and extract the figures
 print ('EXTRACTING THE BODY OF THE DOCUMENT')
@@ -114,21 +134,22 @@ for para in textstore:
         words = sent.split()
         sentences.append(words)
 sentences = np.array(sentences)
-print (sentences.shape)
 
 fittedModel = idenitifier_regressor()
 pred_id = fittedModel.predict(sentences)
 
 #Do the same for the captions
 caps = []
+pageno = []
 tableFlag = 0
 figDict = e['figures']
 for k in range(len(figDict)):
     fig = figDict[k]
     if fig['figType'] == 'Figure':
         caps.append(fig['caption'])
+        pageno.append(fig['page'])
     if fig['figType'] == 'Table':
-        tableFlag = 1
+        tableFlag += 1
 capStore = []
 for cap in caps:
     cap = cap.lower()       #Make everything lower case
@@ -140,7 +161,6 @@ capmodel = caption_regressor(verbose = 1)
 pred_cap = capmodel.predict(capStore)
 args = np.argsort(pred_cap)
 args = args[::-1]
-print (args)
 
 # Run the analysis given the model
 flagid = 0
@@ -159,7 +179,7 @@ if flagid == 0:
             pid.append(pred_id[i])
             flagid = 1
 if flagid == 0:
-    print ('We dont think there is an indicator sentence')
+    #print ('We dont think there is an indicator sentence')
     for i in range(sentences.shape[0]):
         if pred_id[i] > 0.7:
             sid.append(sentences[i])
@@ -173,6 +193,10 @@ I = np.argmax(pid)
 print ('#########################################################')
 print ('# ~~~~~~~~~~~~~~~~~~~~~~ Summary ~~~~~~~~~~~~~~~~~~~~~~ #')
 
+print ('TITLE:')
+print (info.title)
+print ('\n')
+
 if flagid != 0:
     print ('IDENTIFIER SENTENCE:')
     print ('Identifier Found:')
@@ -182,7 +206,7 @@ if flagid != 0:
     identifier = sid[I]
     s = " "         #Use space as the thing to knit the sentences back together
     identifier = s.join(identifier)
-    print (identifier)
+    print ('\n',identifier)
     print ('This identifier scored: ', pid[I])
 
     familyFlag, i = family_check(identifier)
@@ -195,28 +219,36 @@ if flagid != 0:
         print ('We think that this condition may be atypical because we found:')
         print (i)
 
-    number = number_of_patients(identifier)
-    if number != 0 or None:
-        print ('We think that there are', number, 'patients in the article, because the largest number we found was:')
-        print (number)
 
 print ('\n \n FIGURE CAPTIONS:')
 print ('\t WARNING: pdffigures2 doesnt always extract all the figures succesfully \n')
 for a in args:
-    print ('We are %2f confident this figure has a face in it:' % pred_cap[a])
+    print ('- We are %2f confident this figure has a face in it:' % pred_cap[a])
     c = capStore[a]
     s = " "         #Use space as the thing to knit the sentences back together
     c = s.join(c)
     print (c)
+    print ('Found on page', pageno[a])
+    print ('Searching for identifiers:')
+    identifiers = indentifier_analyis(c)
+    print (identifiers)
     familyFlag, i = family_check(c)
     if familyFlag == 1:
-        print ('We think that there is a family connection because we found:')
+        print ('- We think that there is a family connection because we found:')
         print (i)
     unusualFlag, i = unusual_check(c)
     if unusualFlag == 1:
-        print ('We think that this condition may be atypical because we found:')
+        print ('- We think that this condition may be atypical because we found:')
         print (i)
+    surgery_flag, i = surgery(c)
+    if surgery_flag == 1:
+        print ('- WARNING: We think that the person may have had reconstructive surgery because we found:')
+        print (i)
+    flag, i = unaffectedCheck(c)
+    if flag == 1:
+        print ('- WARNING: We think that someone in the photo is not affected because we found:')
+        print (i) 
     print ('\n')
 
-if tableFlag == 1:
-    print ('We think there is information held in a table in this article')
+if tableFlag != 0:
+    print ('We think there is information held in a table in this article, we found ', tableFlag, ' tables')
